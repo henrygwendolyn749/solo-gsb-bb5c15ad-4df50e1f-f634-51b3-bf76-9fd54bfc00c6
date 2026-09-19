@@ -9,6 +9,7 @@ from . import db
 from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
+from .ranking import non_dominated_ranks
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -187,6 +188,159 @@ def plan_batch_pools(
         "total_conflicts": plan.total_conflicts,
         "pools": pools_out,
         "conflicts": conflicts_out,
+    }
+
+
+def _pair_result_to_dict(pair_index: int, r: PairResult) -> dict:
+    """把内存中的 PairResult 转为与 PairOut 一致的字典（不落库）。"""
+    return {
+        "pair_index": pair_index,
+        "name_top": r.name_top,
+        "name_bottom": r.name_bottom,
+        "is_self_dimer": r.is_self_dimer,
+        "alignments_checked": r.alignments_checked,
+        "best_shift": r.best_shift,
+        "overlap_len": r.overlap_len,
+        "continuous_complementary_length": r.max_complementary_run,
+        "three_prime_run_length": r.terminal_run,
+        "top3_run_length": r.top3_run,
+        "bottom3_run_length": r.bottom3_run,
+        "involved_three_prime_ends": list(r.involved_three_prime_ends),
+        "risk_level": r.risk_level,
+        "risk_reasons": list(r.risk_reasons),
+        "alignment": {
+            "top": r.top_line,
+            "match": r.match_line,
+            "bottom": r.bottom_line,
+        },
+    }
+
+
+def rank_batch_replacements(
+    *,
+    batch_id: str,
+    target_name: str,
+    candidates: list[tuple[str, str]],
+) -> dict | None:
+    """对已保存批次做“替换某引物”的内存模拟并按多指标非支配分层。
+
+    批次不存在返回 None（路由层转 404）；目标引物名不存在抛出
+    ValueError（路由层转 422）。每个候选仅计算其自二聚体以及与批次中
+    **其余**引物的异二聚体，复用 analyze_pair 与批次原阈值，不写库，
+    也不重算与该候选无关的原批次配对。
+
+    指标（越小越优）：high 配对数、最大 3′ 连续互补、最大连续互补。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+
+    cont_thr = batch["continuous_threshold"]
+    three_thr = batch["three_prime_threshold"]
+
+    target_idx = next(
+        (i for i, row in enumerate(primers) if row["name"] == target_name),
+        None,
+    )
+    if target_idx is None:
+        raise ValueError(f"批次中不存在名为 {target_name!r} 的引物")
+
+    others = [
+        (i, row["name"], row["sequence"])
+        for i, row in enumerate(primers)
+        if i != target_idx
+    ]
+
+    evaluated: list[dict] = []
+    for input_order, (label, seq) in enumerate(candidates):
+        pairs: list[PairResult] = []
+        # 自二聚体（候选标签即引物名）
+        pairs.append(
+            analyze_pair(
+                label, seq, label, seq,
+                cont_thr, three_thr,
+                is_self_dimer=True,
+            )
+        )
+        # 与其余引物的异二聚体：保持批次位置决定的 top/bottom 方向
+        for other_idx, other_name, other_seq in others:
+            if target_idx < other_idx:
+                top_name, top_seq = label, seq
+                bottom_name, bottom_seq = other_name, other_seq
+            else:
+                top_name, top_seq = other_name, other_seq
+                bottom_name, bottom_seq = label, seq
+            pairs.append(
+                analyze_pair(
+                    top_name, top_seq, bottom_name, bottom_seq,
+                    cont_thr, three_thr,
+                    is_self_dimer=False,
+                )
+            )
+
+        high_count = sum(1 for r in pairs if r.risk_level == "high")
+        max_terminal = max(r.terminal_run for r in pairs)
+        max_cont = max(r.max_complementary_run for r in pairs)
+
+        pair_dicts = [_pair_result_to_dict(i, r) for i, r in enumerate(pairs)]
+        # 配对中“候选一侧”的引物名统一为标签
+        for pdct, r in zip(pair_dicts, pairs):
+            pdct["label"] = label
+            pdct["other_name"] = (
+                label
+                if r.is_self_dimer
+                else (r.name_bottom if r.name_top == label else r.name_top)
+            )
+
+        evaluated.append(
+            {
+                "input_order": input_order,
+                "label": label,
+                "sequence": seq,
+                "evaluated_pair_count": len(pairs),
+                "high_risk_count": high_count,
+                "max_three_prime_run": max_terminal,
+                "max_continuous_complementary": max_cont,
+                "high_risk_pairs": [
+                    pdct for pdct, r in zip(pair_dicts, pairs)
+                    if r.risk_level == "high"
+                ],
+                "max_three_prime_pairs": [
+                    pdct for pdct, r in zip(pair_dicts, pairs)
+                    if r.terminal_run == max_terminal
+                ],
+                "max_continuous_pairs": [
+                    pdct for pdct, r in zip(pair_dicts, pairs)
+                    if r.max_complementary_run == max_cont
+                ],
+            }
+        )
+
+    # 非支配分层：三个指标越小越优
+    vectors = [
+        (
+            item["high_risk_count"],
+            item["max_three_prime_run"],
+            item["max_continuous_complementary"],
+        )
+        for item in evaluated
+    ]
+    ranks = non_dominated_ranks(vectors)
+    for item, rank in zip(evaluated, ranks):
+        item["rank"] = rank
+
+    # 同层按输入顺序稳定排序
+    ranked = sorted(evaluated, key=lambda item: (item["rank"], item["input_order"]))
+
+    return {
+        "batch_id": batch_id,
+        "target_name": target_name,
+        "continuous_threshold": cont_thr,
+        "three_prime_threshold": three_thr,
+        "candidate_count": len(candidates),
+        "ranked_candidates": ranked,
     }
 
 

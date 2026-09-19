@@ -8,7 +8,10 @@
 SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/{id}/pool-plan`
 基于异二聚体结果构建冲突图，按 DSatur 风格确定性贪心把引物分配到若干引物池；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
-对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
+对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）；
+通过 `POST /api/batches/{id}/replacement-ranking` 对某条待替换引物给出
+2～50 条候选序列，纯内存模拟替换后的相关配对，按 high 配对数 / 最大 3′ 连续
+互补 / 最大连续互补三个越小越优的指标做非支配分层（Pareto rank）。
 
 ---
 
@@ -27,6 +30,7 @@ docker compose up --build -d
 | 健康检查 | http://localhost:8000/health |
 | 批次接口 | http://localhost:8000/api/batches |
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
+| 替换候选排序 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
@@ -269,6 +273,95 @@ curl -s http://localhost:8000/api/batches/f98cdd27-.../compare/3fa9c1e2-...
   `introduced_count = target_pair_count - common_pair_count`，
   `resolved_count = base_pair_count - common_pair_count`。
 
+### `POST /api/batches/{id}/replacement-ranking` — 替换引物候选的内存模拟与非支配分层
+
+对**已保存批次**中的一条待替换引物，提交 2～50 条带**唯一标签**的候选 IUPAC 序列，
+服务对每个候选做**纯内存**模拟：用候选序列替换目标引物，复用批次筛查同款二聚体
+算法（`analyze_pair`）与**批次原阈值**，只计算
+
+* 候选自身的**自二聚体** 1 个；
+* 候选与批次中**其余**引物（不含目标）的异二聚体 N−1 个。
+
+**不写库、不持久化，也不重算与候选无关的原批次配对**（其余引物彼此之间的配对
+保持原样，无需参与评估）。异二聚体的 top/bottom 方向沿用“批次位置靠前者为 top”
+的规则，因此结果与真实新建批次完全一致。
+
+按批次原阈值汇总三个**越小越优**的指标：
+
+| 指标 | 含义 |
+| --- | --- |
+| `high_risk_count` | 候选相关配对中风险等级为 `high` 的数量 |
+| `max_three_prime_run` | 各配对 3′ 端连续互补长度（`terminal_run`）的最大值 |
+| `max_continuous_complementary` | 各配对最长连续互补长度的最大值 |
+
+**非支配分层**（Pareto 排序）：候选 A 支配候选 B，当且仅当 A 三个指标均不劣于 B
+且至少一个严格更优；指标完全相同或互有胜负（tradeoff）的候选同层。第 1 层为
+不被任何候选支配者，逐层剥离依次为第 2、3……层。返回的 `ranked_candidates`
+按 `(rank, input_order)` 升序——**同层保持请求中的输入顺序**，结果稳定可复现。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../replacement-ranking \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_name": "F",
+    "candidates": [
+      {"label": "good", "sequence": "GGGGG"},
+      {"label": "t-run", "sequence": "TTTT"},
+      {"label": "pal", "sequence": "ACGT"}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_name` | 批次内待替换引物名称（首尾空白自动规范化；不存在返回 `422`） |
+| `candidates` | 2～50 条候选，每条含唯一 `label`（非空、≤100 字符）与 `sequence`（IUPAC 校验规则同批次提交） |
+| `candidates[].label` | 候选标签，同一请求内必须唯一，重复返回 `422` |
+
+批次不存在返回 `404`；目标引物不存在、候选标签重复、候选数越界、空标签或
+非法 IUPAC 序列均返回 `422`。
+
+返回示例（节选）：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "target_name": "F",
+  "continuous_threshold": 4,
+  "three_prime_threshold": 3,
+  "candidate_count": 3,
+  "ranked_candidates": [
+    {
+      "rank": 1,
+      "input_order": 0,
+      "label": "good",
+      "sequence": "GGGGG",
+      "evaluated_pair_count": 3,
+      "high_risk_count": 0,
+      "max_three_prime_run": 0,
+      "max_continuous_complementary": 0,
+      "high_risk_pairs": [],
+      "max_three_prime_pairs": [ { "...PairOut，同批次筛查字段；另附 label/other_name..." } ],
+      "max_continuous_pairs": []
+    }
+  ]
+}
+```
+
+每个候选结果中：
+
+* `evaluated_pair_count` 恒等于 `1 +（批次引物数 − 1）`；
+* `high_risk_pairs` 为达到 high 的配对；
+* `max_three_prime_pairs` / `max_continuous_pairs` 为**达到对应最大值**的全部配对
+  （最大值为 0 时即全部配对，便于定位“零风险由哪些配对构成”）；
+* 配对对象复用批次筛查的 `PairOut` 全部字段，另附：
+  `label`（候选标签，配对中的候选一侧）与 `other_name`（自二聚体为标签本身，
+  异二聚体为批次原引物名）；异二聚体的 `name_top`/`name_bottom` 保持批次位置方向；
+* 每个候选的 `pair_index` 独立从 0 起，计算顺序为自二聚体在前，
+  异二聚体按其余引物的批次位置升序。
+
 ## 配对结果字段含义
 
 | 字段 | 含义 |
@@ -352,9 +445,10 @@ app/
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
+  ranking.py    # 三指标非支配分层（Pareto rank），同层按输入顺序稳定排序
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、对比与替换排序编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

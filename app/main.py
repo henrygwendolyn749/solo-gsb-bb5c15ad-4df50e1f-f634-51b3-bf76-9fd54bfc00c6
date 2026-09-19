@@ -18,8 +18,10 @@ from .schemas import (
     PoolPlanOut,
     PoolPlanRequest,
     PrimerOut,
+    ReplacementRankingOut,
+    ReplacementRankingRequest,
 )
-from .services import compare_batches, plan_batch_pools, run_batch
+from .services import compare_batches, plan_batch_pools, rank_replacements, run_batch
 
 
 @asynccontextmanager
@@ -169,6 +171,46 @@ def create_pool_plan(batch_id: str, payload: PoolPlanRequest) -> PoolPlanOut:
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return PoolPlanOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/replacement-ranking",
+    tags=["batches"],
+    summary="候选替换引物的内存模拟与非支配分层（不落库）",
+    response_model=ReplacementRankingOut,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "目标引物不存在或候选标签重复"},
+    },
+)
+def create_replacement_ranking(
+    batch_id: str, payload: ReplacementRankingRequest
+) -> ReplacementRankingOut:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    candidates: list[tuple[str, str]] = []
+    for c in payload.candidates:
+        if c.label in seen:
+            duplicates.append(c.label)
+        seen.add(c.label)
+        candidates.append((c.label, c.sequence))
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"候选标签重复: {', '.join(duplicates)}",
+        )
+
+    try:
+        result = rank_replacements(
+            batch_id=batch_id,
+            target_name=payload.target_name,
+            candidates=candidates,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return ReplacementRankingOut(**result)
 
 
 def _load_result(batch_id: str, *, risky_only: bool) -> BatchResult:

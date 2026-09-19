@@ -230,3 +230,90 @@ class BatchCompareResult(BaseModel):
 
 class ErrorOut(BaseModel):
     detail: str
+
+
+class ReplacementCandidateIn(BaseModel):
+    label: str = Field(
+        ..., description="候选标签（非空，本次请求内唯一），仅用于回传标识"
+    )
+    sequence: str = Field(
+        ..., description="5'→3' IUPAC DNA 序列（允许 ATCGRYSWKMBDHVN）"
+    )
+
+    @field_validator("label")
+    @classmethod
+    def _label(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("候选标签不能为空")
+        if len(v) > 100:
+            raise ValueError("候选标签最长 100 字符")
+        return v
+
+    @field_validator("sequence")
+    @classmethod
+    def _sequence(cls, v: str) -> str:
+        seq = validate_iupac(v)
+        if len(seq) > config.MAX_PRIMER_LENGTH:
+            raise ValueError(
+                f"候选序列长度 {len(seq)} 超过上限 {config.MAX_PRIMER_LENGTH}"
+            )
+        return seq
+
+
+class ReplacementRankingRequest(BaseModel):
+    target_name: str = Field(
+        ..., description="待替换引物名称（必须是批次内已存在的引物名）"
+    )
+    candidates: list[ReplacementCandidateIn] = Field(
+        ..., min_length=2, max_length=50, description="2～50 条带唯一标签的候选序列"
+    )
+
+    @field_validator("target_name")
+    @classmethod
+    def _target_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("待替换引物名称不能为空")
+        return v
+
+
+class ReplacementPairOut(PairOut):
+    """替换模拟中受影响的配对（候选自二聚体或候选与其余引物的异二聚体）。"""
+
+
+class ReplacementCandidateOut(BaseModel):
+    label: str
+    sequence: str
+    layer: int = Field(description="非支配层级（1 起，越小越优）")
+    rank: int = Field(description="最终名次（1 起；先按层级，再按输入顺序）")
+    high_pair_count: int = Field(
+        description="按批次原阈值判定为 high 的受影响配对数（含候选自二聚体）"
+    )
+    max_three_prime_run: int = Field(
+        description="受影响配对中的最大 3′连续互补长度"
+    )
+    max_continuous_run: int = Field(
+        description="受影响配对中的最长连续互补长度"
+    )
+    high_pairs: list[ReplacementPairOut] = Field(
+        description="全部 high 受影响配对（按配对索引升序）"
+    )
+    max_three_prime_pairs: list[ReplacementPairOut] = Field(
+        description="3′连续互补达到 max_three_prime_run 的配对（按配对索引升序）"
+    )
+    max_continuous_pairs: list[ReplacementPairOut] = Field(
+        description="连续互补达到 max_continuous_run 的配对（按配对索引升序）"
+    )
+
+
+class ReplacementRankingOut(BaseModel):
+    batch_id: str
+    target_name: str
+    continuous_threshold: int = Field(description="批次原连续互补阈值")
+    three_prime_threshold: int = Field(description="批次原 3′连续互补阈值")
+    primer_count: int = Field(description="批次引物数（模拟中保持不变）")
+    candidate_count: int
+    candidates: list[ReplacementCandidateOut] = Field(
+        description="候选排名（按层、层内按请求输入顺序稳定排序）"
+    )

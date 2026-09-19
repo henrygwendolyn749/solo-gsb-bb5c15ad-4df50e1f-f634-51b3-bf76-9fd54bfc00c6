@@ -9,6 +9,7 @@ from . import db
 from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
+from .ranking import non_dominated_layers
 
 
 def _pair_to_row(pair_index: int, r: PairResult) -> tuple:
@@ -190,8 +191,167 @@ def plan_batch_pools(
     }
 
 
-def _diff_to_out(d: PairDiff) -> dict:
+def _pair_result_to_out(pair_index: int, r: PairResult) -> dict:
+    """内存 PairResult -> PairOut 风格字典（不落库、不经过 db.serialize_pair）。"""
     return {
+        "pair_index": pair_index,
+        "name_top": r.name_top,
+        "name_bottom": r.name_bottom,
+        "is_self_dimer": r.is_self_dimer,
+        "alignments_checked": r.alignments_checked,
+        "best_shift": r.best_shift,
+        "overlap_len": r.overlap_len,
+        "continuous_complementary_length": r.max_complementary_run,
+        "three_prime_run_length": r.terminal_run,
+        "top3_run_length": r.top3_run,
+        "bottom3_run_length": r.bottom3_run,
+        "involved_three_prime_ends": list(r.involved_three_prime_ends),
+        "risk_level": r.risk_level,
+        "risk_reasons": list(r.risk_reasons),
+        "alignment": {
+            "top": r.top_line,
+            "match": r.match_line,
+            "bottom": r.bottom_line,
+        },
+    }
+
+
+def rank_replacements(
+    *,
+    batch_id: str,
+    target_name: str,
+    candidates: list[tuple[str, str]],
+) -> dict | None:
+    """对已保存批次做候选替换引物的内存模拟与非支配分层。
+
+    纯读操作：读取批次阈值与引物序列后，仅在内存中复用 analyze_pair 计算
+    “候选自二聚体 + 候选与其余每条引物的异二聚体”，不写库、不重算任何
+    与目标无关的既有配对。
+
+    批次不存在返回 None（路由层转 404）；目标引物不存在抛出 ValueError
+    （路由层转 422）。candidates 为 (label, normalized_sequence) 列表，
+    标签唯一性由路由层保证。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+
+    continuous_threshold = batch["continuous_threshold"]
+    three_prime_threshold = batch["three_prime_threshold"]
+    n = len(primers)
+
+    target_pos = next(
+        (row["position"] for row in primers if row["name"] == target_name), None
+    )
+    if target_pos is None:
+        raise ValueError(f"批次内不存在名为 {target_name!r} 的引物")
+
+    # 自二聚体在结果序列中占据 position 索引；异二聚体排在全部自二聚体之后，
+    # 与 run_batch 的落库顺序（先 N 个自二聚体，再按 (i,j) i<j 枚举）保持一致
+    self_index = target_pos
+
+    def hetero_index(i: int, j: int) -> int:
+        # 前 i 行异二聚体数 i*(2n-i-1)/2 + 第 i 行内 (i,j) 之前的 j-i-1 个
+        return n + i * (2 * n - i - 1) // 2 + (j - i - 1)
+
+    simulated: list[dict] = []
+    for label, seq in candidates:
+        pairs: list[tuple[int, PairResult]] = []
+
+        # 候选自二聚体（沿用目标引物名，与批次落库命名一致）
+        pairs.append(
+            (
+                self_index,
+                analyze_pair(
+                    target_name, seq, target_name, seq,
+                    continuous_threshold, three_prime_threshold,
+                    is_self_dimer=True,
+                ),
+            )
+        )
+        # 候选与其余引物的异二聚体：top 固定为提交顺序中靠前者
+        for row in primers:
+            other_pos = row["position"]
+            if other_pos == target_pos:
+                continue
+            other_name = row["name"]
+            if target_pos < other_pos:
+                result = analyze_pair(
+                    target_name, seq, other_name, row["sequence"],
+                    continuous_threshold, three_prime_threshold,
+                    is_self_dimer=False,
+                )
+                index = hetero_index(target_pos, other_pos)
+            else:
+                result = analyze_pair(
+                    other_name, row["sequence"], target_name, seq,
+                    continuous_threshold, three_prime_threshold,
+                    is_self_dimer=False,
+                )
+                index = hetero_index(other_pos, target_pos)
+            pairs.append((index, result))
+
+        pairs.sort(key=lambda item: item[0])
+        pair_out = [
+            _pair_result_to_out(index, result) for index, result in pairs
+        ]
+
+        high_pairs = [p for p in pair_out if p["risk_level"] == "high"]
+        max_three = max(p["three_prime_run_length"] for p in pair_out)
+        max_continuous = max(
+            p["continuous_complementary_length"] for p in pair_out
+        )
+        max_three_pairs = [
+            p for p in pair_out if p["three_prime_run_length"] == max_three
+        ]
+        max_continuous_pairs = [
+            p for p in pair_out
+            if p["continuous_complementary_length"] == max_continuous
+        ]
+
+        simulated.append(
+            {
+                "label": label,
+                "sequence": seq,
+                "high_pair_count": len(high_pairs),
+                "max_three_prime_run": max_three,
+                "max_continuous_run": max_continuous,
+                "high_pairs": high_pairs,
+                "max_three_prime_pairs": max_three_pairs,
+                "max_continuous_pairs": max_continuous_pairs,
+            }
+        )
+
+    # 非支配分层：三维指标均越小越优；分层结果天然按输入顺序稳定
+    layers = non_dominated_layers(
+        simulated,
+        lambda c: (
+            c["high_pair_count"],
+            c["max_three_prime_run"],
+            c["max_continuous_run"],
+        ),
+    )
+    ranked: list[dict] = []
+    rank = 1
+    for layer_no, layer in enumerate(layers, start=1):
+        for candidate in layer:
+            ranked.append({**candidate, "layer": layer_no, "rank": rank})
+            rank += 1
+
+    return {
+        "batch_id": batch_id,
+        "target_name": target_name,
+        "continuous_threshold": continuous_threshold,
+        "three_prime_threshold": three_prime_threshold,
+        "primer_count": n,
+        "candidate_count": len(candidates),
+        "candidates": ranked,
+    }
+
+
+def _diff_to_out(d: PairDiff) -> dict:    return {
         "pair_key": d.pair_key,
         "name_a": d.name_a,
         "name_b": d.name_b,

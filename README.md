@@ -7,6 +7,9 @@
 连续长度及中文风险原因；同分时按固定偏移规则取唯一结果。批次与结果持久化到
 SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/{id}/pool-plan`
 基于异二聚体结果构建冲突图，按 DSatur 风格确定性贪心把引物分配到若干引物池；
+通过 `POST /api/batches/{id}/replacement-ranking` 在**内存**中模拟用候选序列
+替换某条引物，按 high 配对数、最大 3′连续互补、最大连续互补三个指标做
+非支配分层排名（不落库）；
 通过 `GET /api/batches/{base_id}/compare/{target_id}` 按引物名称构造稳定配对键，
 对比两个批次的配对风险升降（escalated / deescalated / introduced / resolved）。
 
@@ -27,6 +30,7 @@ docker compose up --build -d
 | 健康检查 | http://localhost:8000/health |
 | 批次接口 | http://localhost:8000/api/batches |
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
+| 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
 > 监听端口 **8000**。SQLite 数据库文件保存在命名卷 `primer-data` 内
@@ -193,6 +197,108 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../pool-plan \
 * 容量允许但冲突图无法完全隔离时（如池数少于色数），算法仍分配全部引物，
   不可避免的冲突通过 `conflicts` 如实返回。
 
+### `POST /api/batches/{id}/replacement-ranking` — 候选替换引物模拟与非支配分层
+
+对**已保存批次**中的一条目标引物，提交 **2～50 条带唯一标签的候选 IUPAC 序列**，
+服务在**内存**中逐条模拟“用候选替换目标引物”后的二聚体情况并排名：
+
+* **只重算受影响配对**：每个候选仅复用现有 `analyze_pair` 二聚体算法计算
+  ① 候选的**自二聚体**、② 候选与**其余每条引物**的异二聚体；目标以外引物
+  彼此之间的既有配对**不重算**；
+* **沿用批次原阈值**：风险等级（`high`/`medium`/`low`）按批次提交时的
+  `continuous_threshold`、`three_prime_threshold` 判定，无需在请求中重复给出；
+* **三个汇总指标（均越小越优）**：
+  1. `high_pair_count` —— 受影响配对中风险等级为 `high` 的数量（含候选自二聚体）；
+  2. `max_three_prime_run` —— 受影响配对中的最大 3′连续互补长度；
+  3. `max_continuous_run` —— 受影响配对中的最长连续互补长度；
+* **非支配分层**：候选 A 在三个指标上均不劣于 B 且至少一维严格更优，则 A
+  支配 B；全体非支配候选为第 1 层，移除后再取非支配集合为第 2 层，依此类推。
+  **同层候选按请求输入顺序稳定排序**（指标完全相同的候选必然同层）；
+* **不落库**：纯内存模拟，不修改批次、引物与已保存配对，也不会新建批次；
+* 批次不存在返回 `404`；目标引物名不存在、候选标签重复（去除首尾空白后比较）、
+  候选数量超出 2～50 或序列含非法 IUPAC 字符返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../replacement-ranking \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_name": "F",
+    "candidates": [
+      {"label": "keep", "sequence": "GGGGGAAAAA"},
+      {"label": "better-3prime", "sequence": "GGGGGAAAA"},
+      {"label": "hairpin-risk", "sequence": "CCCCCGGGGG"}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_name` | 待替换引物名称，必须为批次内已存在的引物名（不存在返回 422） |
+| `candidates` | 2～50 条候选；`label` 非空、请求内唯一（去首尾空白后比较）；`sequence` 为 5′→3′ IUPAC DNA 序列，校验规则与批次提交一致 |
+
+返回示例：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "target_name": "F",
+  "continuous_threshold": 4,
+  "three_prime_threshold": 3,
+  "primer_count": 2,
+  "candidate_count": 3,
+  "candidates": [
+    {
+      "label": "better-3prime",
+      "sequence": "GGGGGAAAA",
+      "layer": 1,
+      "rank": 1,
+      "high_pair_count": 1,
+      "max_three_prime_run": 4,
+      "max_continuous_run": 4,
+      "high_pairs": [ { "pair_index": 2, "name_top": "F", "name_bottom": "R", "...": "与批次配对结果同构" } ],
+      "max_three_prime_pairs": [ { "pair_index": 2, "...": "..." } ],
+      "max_continuous_pairs": [ { "pair_index": 2, "...": "..." } ]
+    },
+    {
+      "label": "keep",
+      "sequence": "GGGGGAAAAA",
+      "layer": 2, "rank": 2,
+      "high_pair_count": 1,
+      "max_three_prime_run": 5,
+      "max_continuous_run": 5,
+      "high_pairs": [ { "pair_index": 2, "...": "..." } ],
+      "max_three_prime_pairs": [ { "pair_index": 2, "...": "..." } ],
+      "max_continuous_pairs": [ { "pair_index": 2, "...": "..." } ]
+    },
+    {
+      "label": "hairpin-risk",
+      "sequence": "CCCCCGGGGG",
+      "layer": 3, "rank": 3,
+      "high_pair_count": 1,
+      "max_three_prime_run": 10,
+      "max_continuous_run": 10,
+      "high_pairs": [ { "pair_index": 0, "name_top": "F", "name_bottom": "F", "is_self_dimer": true, "...": "..." } ],
+      "max_three_prime_pairs": [ { "pair_index": 0, "...": "..." } ],
+      "max_continuous_pairs": [ { "pair_index": 0, "...": "..." } ]
+    }
+  ]
+}
+```
+
+* `layer` 从 1 起（第 1 层即 Pareto 最优集合），`rank` 从 1 起、按层递增；
+  候选的最终顺序为先层级、再输入顺序，稳定可复现；
+* `high_pairs` / `max_three_prime_pairs` / `max_continuous_pairs` 中的每个配对
+  与 `GET /api/batches/{id}` 的配对结果字段**完全同构**（含 `pair_index`、
+  `risk_level`、对齐可视化等）；配对中的引物名沿用目标引物名（候选不入库，
+  不产生新名称）；
+* `pair_index` 与原批次落库位置一致（自二聚体占据目标引物位置，异二聚体按
+  提交顺序枚举），便于与原批次结果按位置对照；
+* 达到最大值的配对**全部**列出（可能有并列多个，包括候选自二聚体）；
+  最大 3′连续互补为 0 时，所有该指标为 0 的受影响配对都会列入
+  `max_three_prime_pairs`。
+
 ### `GET /api/batches/{base_id}/compare/{target_id}` — 批次风险对比
 
 按引物**名称**构造稳定配对键，对比 base → target 两个已保存批次的配对风险：
@@ -351,10 +457,11 @@ app/
   iupac.py      # IUPAC 碱基集合与互补矩阵
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
+  ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名与对比编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

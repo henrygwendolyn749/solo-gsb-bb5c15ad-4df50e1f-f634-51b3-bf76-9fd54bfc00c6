@@ -1,0 +1,232 @@
+"""Pydantic 请求/响应模型与输入校验。"""
+
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, field_validator
+
+from . import config
+from .iupac import validate_iupac
+
+
+class PrimerIn(BaseModel):
+    name: str = Field(..., description="引物名称（非空，批次内唯一）")
+    sequence: str = Field(
+        ..., description="5'→3' IUPAC DNA 序列（允许 ATCGRYSWKMBDHVN）"
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("引物名称不能为空")
+        if len(v) > 100:
+            raise ValueError("引物名称最长 100 字符")
+        return v
+
+    @field_validator("sequence")
+    @classmethod
+    def _sequence(cls, v: str) -> str:
+        seq = validate_iupac(v)
+        if len(seq) > config.MAX_PRIMER_LENGTH:
+            raise ValueError(
+                f"引物长度 {len(seq)} 超过上限 {config.MAX_PRIMER_LENGTH}"
+            )
+        return seq
+
+
+class BatchCreate(BaseModel):
+    primers: list[PrimerIn] = Field(
+        ..., min_length=1, description="带名称的 IUPAC DNA 引物批次"
+    )
+    continuous_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="连续互补长度阈值（达到即提示结合稳定风险）",
+    )
+    three_prime_threshold: int = Field(
+        ...,
+        ge=1,
+        le=config.MAX_PRIMER_LENGTH,
+        description="3′端连续互补长度阈值（达到即提示延伸风险，风险等级 high）",
+    )
+
+
+class AlignmentOut(BaseModel):
+    top: str
+    match: str
+    bottom: str
+
+
+class PairOut(BaseModel):
+    pair_index: int
+    name_top: str
+    name_bottom: str
+    is_self_dimer: bool
+    alignments_checked: int
+    best_shift: int = Field(
+        description=(
+            "最危险对齐的带符号错位：bottom 3′端碱基的全局列坐标（top 5′端 "
+            "T0 位于列 0）。0=齐平，>0=bottom 3′端伸入 top，<0=悬空于 top 5′左侧"
+        )
+    )
+    overlap_len: int
+    continuous_complementary_length: int
+    three_prime_run_length: int
+    top3_run_length: int
+    bottom3_run_length: int
+    involved_three_prime_ends: list[str]
+    risk_level: str = Field(description="high / medium / low")
+    risk_reasons: list[str]
+    alignment: AlignmentOut
+
+
+class PrimerOut(BaseModel):
+    position: int
+    name: str
+    sequence: str
+
+
+class BatchSummary(BaseModel):
+    id: str
+    created_at: str
+    continuous_threshold: int
+    three_prime_threshold: int
+    primer_count: int
+    pair_count: int
+    high_risk_count: int
+    medium_risk_count: int
+    low_risk_count: int
+
+
+class BatchResult(BatchSummary):
+    primers: list[PrimerOut]
+    pairs: list[PairOut]
+
+
+class BatchList(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    batches: list[BatchSummary]
+
+
+_RISK_LEVELS = ("high", "medium", "low")
+
+
+class PoolPlanRequest(BaseModel):
+    pool_count: int = Field(
+        ..., ge=1, le=10000, description="池数量（至少 1）"
+    )
+    pool_capacity: int = Field(
+        ..., ge=1, le=10000, description="每池容量（每池最多容纳的引物数）"
+    )
+    isolated_risk_levels: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "需隔离的异二聚体风险等级（仅 high/medium/low）；达到这些等级的"
+            "异二聚体两两构成冲突图边，自二聚体忽略。重复值自动去重"
+        ),
+    )
+
+    @field_validator("isolated_risk_levels")
+    @classmethod
+    def _isolated_risk_levels(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for value in values:
+            level = value.strip().lower()
+            if level not in _RISK_LEVELS:
+                bad.append(value)
+            elif level not in normalized:
+                normalized.append(level)
+        if bad:
+            raise ValueError(
+                "风险等级仅支持 high/medium/low，非法值: "
+                + ", ".join(repr(v) for v in bad)
+            )
+        return normalized
+
+
+class PoolConflictEdgeOut(BaseModel):
+    pool: int = Field(description="冲突所在池号（0 起）")
+    position_a: int = Field(description="引物 A 在批次中的位置")
+    position_b: int = Field(description="引物 B 在批次中的位置")
+    name_a: str
+    name_b: str
+    risk_level: str = Field(description="high / medium / low")
+
+
+class PoolOut(BaseModel):
+    pool: int = Field(description="池号（0 起）")
+    capacity: int
+    members: list[str] = Field(description="池内引物名称（按批次位置升序）")
+    member_positions: list[int] = Field(
+        description="与 members 一一对应的批次位置"
+    )
+    conflict_count: int = Field(description="该池内部的同池冲突边数")
+
+
+class PoolPlanOut(BaseModel):
+    batch_id: str
+    pool_count: int
+    pool_capacity: int
+    isolated_risk_levels: list[str]
+    primer_count: int
+    assigned_count: int = Field(description="实际分配引物数（容量允许时等于引物数）")
+    total_conflicts: int = Field(description="全部池的同池冲突边总数")
+    pools: list[PoolOut]
+    conflicts: list[PoolConflictEdgeOut]
+
+
+class ComparePairOut(BaseModel):
+    pair_key: str = Field(
+        description="稳定配对键：自二聚体为单名，异二聚体为按名称字典序的 A|B"
+    )
+    name_a: str = Field(description="配对键第一名称（异二聚体为字典序较小者）")
+    name_b: str = Field(description="配对键第二名称（自二聚体与 name_a 相同）")
+    is_self_dimer: bool
+    sequence_changed: bool = Field(
+        description="配对中任一同名引物在两批次间序列不同"
+    )
+    base_risk_level: str | None = Field(
+        description="base 批次风险等级（introduced 时为 null）"
+    )
+    target_risk_level: str | None = Field(
+        description="target 批次风险等级（resolved 时为 null）"
+    )
+
+
+class CompareSummary(BaseModel):
+    base_batch_id: str
+    target_batch_id: str
+    base_pair_count: int = Field(description="base 批次配对总数")
+    target_pair_count: int = Field(description="target 批次配对总数")
+    common_pair_count: int = Field(description="两批次共有的配对键数")
+    unchanged_pair_count: int = Field(description="共有配对中风险等级不变的数量")
+    escalated_count: int
+    deescalated_count: int
+    introduced_count: int
+    resolved_count: int
+
+
+class BatchCompareResult(BaseModel):
+    summary: CompareSummary
+    escalated: list[ComparePairOut] = Field(
+        description="共有配对中风险等级上升（low<medium<high）的明细，按配对名排序"
+    )
+    deescalated: list[ComparePairOut] = Field(
+        description="共有配对中风险等级下降的明细，按配对名排序"
+    )
+    introduced: list[ComparePairOut] = Field(
+        description="仅存在于 target 批次的配对明细，按配对名排序"
+    )
+    resolved: list[ComparePairOut] = Field(
+        description="仅存在于 base 批次的配对明细，按配对名排序"
+    )
+
+
+class ErrorOut(BaseModel):
+    detail: str
